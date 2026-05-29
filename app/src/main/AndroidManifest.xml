@@ -25,6 +25,11 @@
             android:turnScreenOn="true" />
 
         <activity
+            android:name=".RunMapActivity"
+            android:exported="false"
+            android:label="@string/app_name" />
+
+        <activity
             android:name=".MainActivity"
             android:exported="true"
             android:icon="@drawable/ic_launcher"

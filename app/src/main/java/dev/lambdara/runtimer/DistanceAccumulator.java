@@ -16,13 +16,14 @@ final class DistanceAccumulator {
         lastAccepted = null;
     }
 
-    double add(double latitude, double longitude, long timeMillis, boolean hasAccuracy, float accuracyMeters) {
+    AddResult add(double latitude, double longitude, long timeMillis, boolean hasAccuracy, float accuracyMeters) {
         if (hasAccuracy && accuracyMeters > maxAccuracyMeters) {
-            return 0d;
+            return AddResult.rejected();
         }
 
         Sample current = new Sample(latitude, longitude, timeMillis);
         double addedMeters = 0d;
+        boolean connectsFromPrevious = false;
         if (lastAccepted != null) {
             double distanceMeters = distanceMeters(lastAccepted, current);
             long deltaMillis = Math.max(0L, current.timeMillis - lastAccepted.timeMillis);
@@ -32,10 +33,11 @@ final class DistanceAccumulator {
                     || speedMetersPerSecond <= maxSpeedMetersPerSecond
                     || distanceMeters < 20d)) {
                 addedMeters = distanceMeters;
+                connectsFromPrevious = true;
             }
         }
         lastAccepted = current;
-        return addedMeters;
+        return new AddResult(addedMeters, true, connectsFromPrevious);
     }
 
     static double distanceMeters(double lat1, double lon1, double lat2, double lon2) {
@@ -52,6 +54,22 @@ final class DistanceAccumulator {
 
     private static double distanceMeters(Sample first, Sample second) {
         return distanceMeters(first.latitude, first.longitude, second.latitude, second.longitude);
+    }
+
+    static final class AddResult {
+        final double addedMeters;
+        final boolean recorded;
+        final boolean connectsFromPrevious;
+
+        AddResult(double addedMeters, boolean recorded, boolean connectsFromPrevious) {
+            this.addedMeters = addedMeters;
+            this.recorded = recorded;
+            this.connectsFromPrevious = connectsFromPrevious;
+        }
+
+        static AddResult rejected() {
+            return new AddResult(0d, false, false);
+        }
     }
 
     private static final class Sample {

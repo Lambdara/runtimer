@@ -538,6 +538,8 @@ public final class MainActivity extends Activity {
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(dp(14), dp(12), dp(14), dp(12));
         card.setBackground(cardBackground(Color.WHITE));
+        card.setClickable(true);
+        card.setOnClickListener(view -> openRunMap(run));
 
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
@@ -589,6 +591,11 @@ public final class MainActivity extends Activity {
         }
 
         return card;
+    }
+
+    private void openRunMap(JSONObject run) {
+        long id = run.optLong("id", run.optLong("startedAt"));
+        startActivity(RunMapActivity.intentFor(this, id));
     }
 
     private void confirmDeleteRun(JSONObject run) {

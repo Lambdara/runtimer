@@ -35,6 +35,17 @@ final class RunLogStore {
         prefs(context).edit().putString(KEY_LOGS, newRuns.toString()).apply();
     }
 
+    static JSONObject findRun(Context context, long id) {
+        JSONArray runs = loadRuns(context);
+        for (int i = 0; i < runs.length(); i++) {
+            JSONObject run = runs.optJSONObject(i);
+            if (run != null && run.optLong("id", run.optLong("startedAt")) == id) {
+                return run;
+            }
+        }
+        return null;
+    }
+
     static void deleteRun(Context context, long id) {
         JSONArray oldRuns = loadRuns(context);
         JSONArray newRuns = new JSONArray();

@@ -86,6 +86,7 @@ public final class RunService extends Service {
     private double[] phaseMeters = new double[0];
     private long[] phaseActualMillis = new long[0];
     private boolean[] phaseFinished = new boolean[0];
+    private JSONArray routePoints = new JSONArray();
     private int state = STATE_IDLE;
     private int phaseIndex = 0;
     private long runStartedWallMillis = 0L;
@@ -157,6 +158,7 @@ public final class RunService extends Service {
             phaseMeters = new double[phases.size()];
             phaseActualMillis = new long[phases.size()];
             phaseFinished = new boolean[phases.size()];
+            routePoints = new JSONArray();
             phaseIndex = 0;
             resumeMediaAfterAlert = false;
             scheduleText = intent.getStringExtra(EXTRA_SCHEDULE_TEXT);
@@ -206,6 +208,8 @@ public final class RunService extends Service {
         phaseMeters = doubleArray(active.getJSONArray("phaseMeters"), phases.size());
         phaseActualMillis = longArray(active.getJSONArray("phaseActualMillis"), phases.size());
         phaseFinished = booleanArray(active.getJSONArray("phaseFinished"), phases.size());
+        JSONArray restoredRoutePoints = active.optJSONArray("routePoints");
+        routePoints = restoredRoutePoints == null ? new JSONArray() : restoredRoutePoints;
         state = active.optInt("state", STATE_IDLE);
         phaseIndex = active.optInt("phaseIndex", 0);
         runStartedWallMillis = active.optLong("runStartedWallMillis", System.currentTimeMillis());
@@ -319,6 +323,7 @@ public final class RunService extends Service {
             }
             log.put("totalDistanceMeters", totalMeters);
             log.put("phases", phaseLogs);
+            log.put("routePoints", routePoints);
             RunLogStore.saveRun(this, log);
         } catch (JSONException exception) {
             Log.e(TAG, "Could not save run log", exception);
@@ -366,15 +371,34 @@ public final class RunService extends Service {
         if (state != STATE_RUNNING || phaseIndex < 0 || phaseIndex >= phaseMeters.length) {
             return;
         }
-        phaseMeters[phaseIndex] += distanceAccumulator.add(
+        long locationTime = location.getTime() == 0L ? System.currentTimeMillis() : location.getTime();
+        DistanceAccumulator.AddResult distanceResult = distanceAccumulator.add(
                 location.getLatitude(),
                 location.getLongitude(),
-                location.getTime(),
+                locationTime,
                 location.hasAccuracy(),
                 location.getAccuracy());
+        phaseMeters[phaseIndex] += distanceResult.addedMeters;
+        if (distanceResult.recorded) {
+            appendRoutePoint(location, locationTime, !distanceResult.connectsFromPrevious);
+        }
         long now = SystemClock.elapsedRealtime();
         if (now - lastStatusWriteElapsedMillis >= 3000L) {
             writeActiveStatus(false);
+        }
+    }
+
+    private void appendRoutePoint(Location location, long locationTime, boolean breakBefore) {
+        try {
+            JSONObject point = new JSONObject();
+            point.put("lat", location.getLatitude());
+            point.put("lon", location.getLongitude());
+            point.put("time", locationTime);
+            point.put("phase", phaseIndex);
+            point.put("breakBefore", breakBefore);
+            routePoints.put(point);
+        } catch (JSONException exception) {
+            Log.w(TAG, "Could not record route point", exception);
         }
     }
 
@@ -397,6 +421,7 @@ public final class RunService extends Service {
             active.put("phaseMeters", doubleJsonArray(phaseMeters));
             active.put("phaseActualMillis", longJsonArray(phaseActualMillis));
             active.put("phaseFinished", booleanJsonArray(phaseFinished));
+            active.put("routePoints", routePoints);
             RunLogStore.saveActive(this, active);
             lastStatusWriteElapsedMillis = SystemClock.elapsedRealtime();
             if (broadcast) {

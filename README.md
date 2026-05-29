@@ -45,6 +45,12 @@ Enter one phase per row. Each row has minutes, seconds, a label, a drag handle,
 and a delete button. Filling the empty row at the bottom automatically creates
 another empty row.
 
+## History
+
+Completed and aborted runs are saved in the history log. Tap a run to view its
+recorded route with phase-colored segments, start and end markers, total
+distance, and phase distances.
+
 ## License
 
 Run Timer's own source code is licensed under the GNU General Public License
