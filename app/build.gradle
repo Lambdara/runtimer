@@ -1,0 +1,25 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "dev.lambdara.runtimer"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "dev.lambdara.runtimer"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "0.1.0"
+    }
+}
+
+tasks.register("simulateDistance", JavaExec) {
+    dependsOn "compileDebugJavaWithJavac", "compileDebugUnitTestJavaWithJavac"
+    classpath = files(
+            "$buildDir/intermediates/javac/debug/compileDebugJavaWithJavac/classes",
+            "$buildDir/intermediates/javac/debugUnitTest/compileDebugUnitTestJavaWithJavac/classes"
+    )
+    mainClass = "dev.lambdara.runtimer.DistanceAccumulatorSelfTest"
+}
