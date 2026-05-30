@@ -42,6 +42,13 @@ public final class PhaseAlertActivity extends Activity {
         }
     }
 
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        render();
+    }
+
     @SuppressLint("ObsoleteSdkInt")
     @SuppressWarnings("deprecation")
     private void prepareLockScreenWindow() {

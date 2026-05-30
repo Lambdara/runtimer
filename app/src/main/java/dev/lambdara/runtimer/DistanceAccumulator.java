@@ -76,7 +76,7 @@ final class DistanceAccumulator {
                 ? 0d
                 : Math.min(distanceMeters(lastCounted, filtered), rawMetersFromLastCounted);
         if (lastCounted != null && rawMetersFromLastCounted < movementGateMeters) {
-            return AddResult.rejected();
+            return AddResult.notRecorded(currentSpeedMetersPerSecond());
         }
 
         lastCounted = filtered;
@@ -84,7 +84,8 @@ final class DistanceAccumulator {
                 segmentMeters,
                 segmentMeters > 0d,
                 projection.latitude(filtered.y),
-                projection.longitude(filtered.x));
+                projection.longitude(filtered.x),
+                currentSpeedMetersPerSecond());
     }
 
     private AddResult initialize(double latitude, double longitude, long timeMillis, double accuracy) {
@@ -95,7 +96,7 @@ final class DistanceAccumulator {
         lastRaw = new MeterSample(0d, 0d, timeMillis);
         lastCounted = new MeterSample(0d, 0d, timeMillis);
         lastFilterTimeMillis = timeMillis;
-        return AddResult.recorded(0d, false, latitude, longitude);
+        return AddResult.recorded(0d, false, latitude, longitude, 0d);
     }
 
     private boolean isOutlier(MeterSample raw) {
@@ -128,6 +129,13 @@ final class DistanceAccumulator {
                 Math.max(MIN_COUNTED_SEGMENT_METERS, accuracyMeters * NOISE_GATE_ACCURACY_FRACTION));
     }
 
+    private double currentSpeedMetersPerSecond() {
+        if (xFilter == null || yFilter == null) {
+            return Double.NaN;
+        }
+        return Math.min(maxSpeedMetersPerSecond, Math.hypot(xFilter.velocity, yFilter.velocity));
+    }
+
     static double distanceMeters(double lat1, double lon1, double lat2, double lon2) {
         double lat1Rad = Math.toRadians(lat1);
         double lat2Rad = Math.toRadians(lat2);
@@ -150,30 +158,50 @@ final class DistanceAccumulator {
         final boolean connectsFromPrevious;
         final double latitude;
         final double longitude;
+        final double currentSpeedMetersPerSecond;
 
         AddResult(
                 double addedMeters,
                 boolean recorded,
                 boolean connectsFromPrevious,
                 double latitude,
-                double longitude) {
+                double longitude,
+                double currentSpeedMetersPerSecond) {
             this.addedMeters = addedMeters;
             this.recorded = recorded;
             this.connectsFromPrevious = connectsFromPrevious;
             this.latitude = latitude;
             this.longitude = longitude;
+            this.currentSpeedMetersPerSecond = currentSpeedMetersPerSecond;
         }
 
         static AddResult recorded(
                 double addedMeters,
                 boolean connectsFromPrevious,
                 double latitude,
-                double longitude) {
-            return new AddResult(addedMeters, true, connectsFromPrevious, latitude, longitude);
+                double longitude,
+                double currentSpeedMetersPerSecond) {
+            return new AddResult(
+                    addedMeters,
+                    true,
+                    connectsFromPrevious,
+                    latitude,
+                    longitude,
+                    currentSpeedMetersPerSecond);
+        }
+
+        static AddResult notRecorded(double currentSpeedMetersPerSecond) {
+            return new AddResult(
+                    0d,
+                    false,
+                    false,
+                    Double.NaN,
+                    Double.NaN,
+                    currentSpeedMetersPerSecond);
         }
 
         static AddResult rejected() {
-            return new AddResult(0d, false, false, Double.NaN, Double.NaN);
+            return new AddResult(0d, false, false, Double.NaN, Double.NaN, Double.NaN);
         }
     }
 

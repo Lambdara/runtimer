@@ -21,11 +21,14 @@ import android.media.Ringtone;
 import android.media.RingtoneManager;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.util.Log;
@@ -53,10 +56,15 @@ public final class RunService extends Service {
     static final int STATE_AWAITING_DISMISS = 2;
 
     private static final String TAG = "RunService";
-    private static final String CHANNEL_RUN = "run_status";
-    private static final String CHANNEL_ALERT = "phase_alerts";
+    private static final String CHANNEL_RUN = "run_status_v4";
+    private static final String CHANNEL_ALERT = "phase_alerts_v2";
     private static final int NOTIFICATION_ID = 41;
+    private static final int ALERT_NOTIFICATION_ID = 42;
     private static final long LOCATION_INTERVAL_MS = 1000L;
+    private static final long NOTIFICATION_UPDATE_INTERVAL_MS = 5000L;
+    private static final long SPEED_CUE_INTERVAL_MS = 30_000L;
+    private static final long SPEED_STALE_MS = 15_000L;
+    private static final double MIN_DISPLAY_SPEED_METERS_PER_SECOND = 0.35d;
     private static final float LOCATION_MIN_METERS = 0f;
     private static final float MAX_GOOD_ACCURACY_METERS = DistanceAccumulator.DEFAULT_MAX_ACCURACY_METERS;
     private static final double MAX_REASONABLE_SPEED_METERS_PER_SECOND =
@@ -80,6 +88,8 @@ public final class RunService extends Service {
         }
     };
     private final Runnable phaseEndRunnable = this::onPhaseTimeExpired;
+    private final Runnable statusNotificationRunnable = this::refreshOngoingNotification;
+    private final Runnable speedCueRunnable = this::onSpeedCueDue;
     private final AudioManager.OnAudioFocusChangeListener audioFocusListener = focusChange -> {
     };
 
@@ -102,8 +112,16 @@ public final class RunService extends Service {
     private Ringtone ringtone;
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
+    private AudioFocusRequest speechFocusRequest;
     private Vibrator vibrator;
     private boolean resumeMediaAfterAlert;
+    private double currentSpeedMetersPerSecond = Double.NaN;
+    private long lastSpeedUpdateElapsedMillis = 0L;
+    private long lastSpeedCueElapsedMillis = 0L;
+    private TextToSpeech textToSpeech;
+    private boolean textToSpeechReady;
+    private boolean textToSpeechInitializing;
+    private int speechUtteranceSequence;
 
     @Override
     public void onCreate() {
@@ -141,6 +159,8 @@ public final class RunService extends Service {
         handler.removeCallbacksAndMessages(null);
         stopLocationUpdates();
         stopAlertSound();
+        stopSpeedSpeech();
+        shutdownTextToSpeech();
         releaseWakeLock();
         super.onDestroy();
     }
@@ -161,6 +181,9 @@ public final class RunService extends Service {
             phaseFinished = new boolean[phases.size()];
             routePoints = new JSONArray();
             phaseIndex = 0;
+            currentSpeedMetersPerSecond = Double.NaN;
+            lastSpeedUpdateElapsedMillis = 0L;
+            lastSpeedCueElapsedMillis = 0L;
             resumeMediaAfterAlert = false;
             scheduleText = intent.getStringExtra(EXTRA_SCHEDULE_TEXT);
             if (scheduleText == null) {
@@ -172,6 +195,9 @@ public final class RunService extends Service {
             startForegroundWith(buildOngoingNotification());
             acquireWakeLock();
             startLocationUpdates();
+            if (hasSpeedCuePhases()) {
+                ensureTextToSpeech();
+            }
             startPhase(0);
         } catch (JSONException | IllegalArgumentException exception) {
             Log.e(TAG, "Could not start run", exception);
@@ -187,15 +213,22 @@ public final class RunService extends Service {
         }
         try {
             restoreFromStatus(active);
-            startForegroundWith(state == STATE_AWAITING_DISMISS ? buildAlertNotification() : buildOngoingNotification());
+            startForegroundWith(buildOngoingNotification());
             acquireWakeLock();
             startLocationUpdates();
             if (state == STATE_RUNNING) {
                 long delay = Math.max(0L, phaseEndsElapsedMillis - SystemClock.elapsedRealtime());
                 handler.removeCallbacks(phaseEndRunnable);
                 handler.postDelayed(phaseEndRunnable, delay);
+                startNotificationTicker();
+                scheduleNextSpeedCue();
+                if (hasSpeedCuePhases()) {
+                    ensureTextToSpeech();
+                }
             } else if (state == STATE_AWAITING_DISMISS) {
                 startAlertSound();
+                postAlertNotification();
+                launchAlertActivity();
             }
         } catch (JSONException exception) {
             Log.e(TAG, "Could not restore active run", exception);
@@ -219,6 +252,9 @@ public final class RunService extends Service {
         phaseEndsElapsedMillis = active.optLong("phaseEndsElapsedMillis", SystemClock.elapsedRealtime());
         scheduleText = active.optString("scheduleText", "");
         resumeMediaAfterAlert = active.optBoolean("resumeMediaAfterAlert", false);
+        currentSpeedMetersPerSecond = active.optDouble("currentSpeedMetersPerSecond", Double.NaN);
+        lastSpeedUpdateElapsedMillis = active.optLong("lastSpeedUpdateElapsedMillis", 0L);
+        lastSpeedCueElapsedMillis = active.optLong("lastSpeedCueElapsedMillis", 0L);
     }
 
     private void startPhase(int index) {
@@ -230,10 +266,13 @@ public final class RunService extends Service {
         phaseEndsElapsedMillis = phaseStartedElapsedMillis + phases.get(index).durationMillis;
         phaseActualMillis[index] = 0L;
         phaseFinished[index] = false;
+        lastSpeedCueElapsedMillis = phaseStartedElapsedMillis;
         distanceAccumulator.reset();
         handler.postDelayed(phaseEndRunnable, phases.get(index).durationMillis);
         writeActiveStatus(true);
         notifyForeground(buildOngoingNotification());
+        startNotificationTicker();
+        scheduleNextSpeedCue();
     }
 
     private void onPhaseTimeExpired() {
@@ -243,12 +282,15 @@ public final class RunService extends Service {
         phaseActualMillis[phaseIndex] = phases.get(phaseIndex).durationMillis;
         phaseFinished[phaseIndex] = true;
         state = STATE_AWAITING_DISMISS;
+        handler.removeCallbacks(statusNotificationRunnable);
+        handler.removeCallbacks(speedCueRunnable);
         distanceAccumulator.reset();
+        stopSpeedSpeech();
         resumeMediaAfterAlert = audioManager != null && audioManager.isMusicActive();
         writeActiveStatus(true);
         startAlertSound();
-        Notification notification = buildAlertNotification();
-        notifyForeground(notification);
+        notifyForeground(buildOngoingNotification());
+        postAlertNotification();
         launchAlertActivity();
     }
 
@@ -256,6 +298,7 @@ public final class RunService extends Service {
         if (state != STATE_AWAITING_DISMISS) {
             return;
         }
+        cancelAlertNotification();
         stopAlertSound();
         if (phaseIndex >= phases.size() - 1) {
             stopRun(false);
@@ -283,8 +326,12 @@ public final class RunService extends Service {
     private void cleanupStoppedRun() {
         state = STATE_IDLE;
         handler.removeCallbacks(phaseEndRunnable);
+        handler.removeCallbacks(statusNotificationRunnable);
+        handler.removeCallbacks(speedCueRunnable);
         stopLocationUpdates();
         stopAlertSound();
+        stopSpeedSpeech();
+        cancelAlertNotification();
         releaseWakeLock();
         RunLogStore.clearActive(this);
         sendBroadcast(new Intent(ACTION_STATUS_CHANGED).setPackage(getPackageName()));
@@ -380,6 +427,13 @@ public final class RunService extends Service {
                 locationTime,
                 location.hasAccuracy(),
                 location.getAccuracy());
+        if (Double.isFinite(distanceResult.currentSpeedMetersPerSecond)) {
+            currentSpeedMetersPerSecond = distanceResult.currentSpeedMetersPerSecond;
+            if (currentSpeedMetersPerSecond < MIN_DISPLAY_SPEED_METERS_PER_SECOND) {
+                currentSpeedMetersPerSecond = 0d;
+            }
+            lastSpeedUpdateElapsedMillis = SystemClock.elapsedRealtime();
+        }
         phaseMeters[phaseIndex] += distanceResult.addedMeters;
         if (distanceResult.recorded) {
             appendRoutePoint(
@@ -423,6 +477,11 @@ public final class RunService extends Service {
             active.put("runStartedElapsedMillis", runStartedElapsedMillis);
             active.put("scheduleText", scheduleText);
             active.put("resumeMediaAfterAlert", resumeMediaAfterAlert);
+            if (Double.isFinite(currentSpeedMetersPerSecond)) {
+                active.put("currentSpeedMetersPerSecond", currentSpeedMetersPerSecond);
+            }
+            active.put("lastSpeedUpdateElapsedMillis", lastSpeedUpdateElapsedMillis);
+            active.put("lastSpeedCueElapsedMillis", lastSpeedCueElapsedMillis);
             active.put("phases", phasesJsonArray());
             active.put("phaseMeters", doubleJsonArray(phaseMeters));
             active.put("phaseActualMillis", longJsonArray(phaseActualMillis));
@@ -502,6 +561,8 @@ public final class RunService extends Service {
                 NotificationManager.IMPORTANCE_LOW);
         runChannel.setDescription("Shows that the run timer is active.");
         runChannel.setSound(null, null);
+        runChannel.enableVibration(false);
+        runChannel.setLockscreenVisibility(Notification.VISIBILITY_PRIVATE);
         manager.createNotificationChannel(runChannel);
 
         NotificationChannel alertChannel = new NotificationChannel(
@@ -510,6 +571,7 @@ public final class RunService extends Service {
                 NotificationManager.IMPORTANCE_HIGH);
         alertChannel.setDescription("Shows phase transition alerts.");
         alertChannel.setBypassDnd(true);
+        alertChannel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
         manager.createNotificationChannel(alertChannel);
     }
 
@@ -524,7 +586,9 @@ public final class RunService extends Service {
         if (state == STATE_RUNNING && phaseIndex >= 0 && phaseIndex < phases.size()) {
             long remaining = Math.max(0L, phaseEndsElapsedMillis - SystemClock.elapsedRealtime());
             title = phases.get(phaseIndex).title();
-            text = "Remaining " + RunPhase.formatClock(remaining) + " - " + formatDistance(totalDistanceMeters());
+            text = "Remaining " + RunPhase.formatClock(remaining)
+                    + " - " + formatCurrentSpeedForDisplay()
+                    + " - " + formatDistance(totalDistanceMeters());
         } else if (state == STATE_AWAITING_DISMISS) {
             title = "Phase finished";
             text = alertLineOne();
@@ -534,15 +598,25 @@ public final class RunService extends Service {
         builder.setSmallIcon(R.drawable.ic_stat_run_timer)
                 .setContentTitle(title)
                 .setContentText(text)
+                .setStyle(new Notification.BigTextStyle().bigText(notificationBigText(text)))
                 .setContentIntent(contentPendingIntent)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
+                .setShowWhen(true)
                 .addAction(new Notification.Action.Builder(
                         Icon.createWithResource(this, R.drawable.ic_stat_run_timer),
                         "End run",
                         stopPendingIntent).build());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
+        }
+        if (state == STATE_RUNNING && phaseIndex >= 0 && phaseIndex < phases.size()) {
+            builder.setWhen(System.currentTimeMillis() + Math.max(0L, phaseEndsElapsedMillis - SystemClock.elapsedRealtime()))
+                    .setUsesChronometer(true)
+                    .setChronometerCountDown(true);
+        }
         builder.setCategory(Notification.CATEGORY_SERVICE);
-        builder.setVisibility(Notification.VISIBILITY_PUBLIC);
+        builder.setVisibility(Notification.VISIBILITY_PRIVATE);
         return builder.build();
     }
 
@@ -604,6 +678,44 @@ public final class RunService extends Service {
     private void notifyForeground(Notification notification) {
         NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         manager.notify(NOTIFICATION_ID, notification);
+    }
+
+    private void postAlertNotification() {
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        manager.notify(ALERT_NOTIFICATION_ID, buildAlertNotification());
+    }
+
+    private void cancelAlertNotification() {
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        manager.cancel(ALERT_NOTIFICATION_ID);
+    }
+
+    private void startNotificationTicker() {
+        handler.removeCallbacks(statusNotificationRunnable);
+        if (state == STATE_RUNNING) {
+            handler.post(statusNotificationRunnable);
+        }
+    }
+
+    private void refreshOngoingNotification() {
+        if (state != STATE_RUNNING) {
+            return;
+        }
+        notifyForeground(buildOngoingNotification());
+        handler.postDelayed(statusNotificationRunnable, NOTIFICATION_UPDATE_INTERVAL_MS);
+    }
+
+    private String notificationBigText(String text) {
+        if (state != STATE_RUNNING || phaseIndex < 0 || phaseIndex >= phases.size()) {
+            return text;
+        }
+        StringBuilder builder = new StringBuilder();
+        builder.append("Current: ").append(phases.get(phaseIndex).title());
+        if (phaseIndex < phases.size() - 1) {
+            builder.append('\n').append("Next: ").append(phases.get(phaseIndex + 1).title());
+        }
+        builder.append('\n').append(text);
+        return builder.toString();
     }
 
     private void launchAlertActivity() {
@@ -693,6 +805,126 @@ public final class RunService extends Service {
         audioManager.dispatchMediaKeyEvent(up);
     }
 
+    private void scheduleNextSpeedCue() {
+        handler.removeCallbacks(speedCueRunnable);
+        if (state != STATE_RUNNING || !currentPhaseUsesSpeedCues()) {
+            return;
+        }
+        ensureTextToSpeech();
+        long now = SystemClock.elapsedRealtime();
+        long base = lastSpeedCueElapsedMillis > 0L ? lastSpeedCueElapsedMillis : phaseStartedElapsedMillis;
+        long nextCueElapsedMillis = base + SPEED_CUE_INTERVAL_MS;
+        while (nextCueElapsedMillis <= now) {
+            nextCueElapsedMillis += SPEED_CUE_INTERVAL_MS;
+        }
+        if (now >= phaseEndsElapsedMillis - 2000L) {
+            return;
+        }
+        if (nextCueElapsedMillis >= phaseEndsElapsedMillis - 2000L) {
+            return;
+        }
+        handler.postDelayed(speedCueRunnable, Math.max(0L, nextCueElapsedMillis - now));
+    }
+
+    private void onSpeedCueDue() {
+        if (state != STATE_RUNNING || !currentPhaseUsesSpeedCues()) {
+            return;
+        }
+        lastSpeedCueElapsedMillis = SystemClock.elapsedRealtime();
+        speakCurrentSpeed();
+        writeActiveStatus(false);
+        scheduleNextSpeedCue();
+    }
+
+    private void speakCurrentSpeed() {
+        ensureTextToSpeech();
+        if (!textToSpeechReady || textToSpeech == null) {
+            return;
+        }
+        if (!requestSpeechAudioFocus()) {
+            return;
+        }
+        String utteranceId = "speed-" + (++speechUtteranceSequence);
+        int result = textToSpeech.speak(speedSpeechText(), TextToSpeech.QUEUE_FLUSH, new Bundle(), utteranceId);
+        if (result == TextToSpeech.ERROR) {
+            abandonSpeechAudioFocus();
+        }
+    }
+
+    private void ensureTextToSpeech() {
+        if (textToSpeech != null || textToSpeechInitializing) {
+            return;
+        }
+        textToSpeechInitializing = true;
+        textToSpeech = new TextToSpeech(getApplicationContext(), status -> {
+            textToSpeechInitializing = false;
+            textToSpeechReady = status == TextToSpeech.SUCCESS;
+            if (!textToSpeechReady || textToSpeech == null) {
+                return;
+            }
+            textToSpeech.setLanguage(Locale.getDefault());
+            textToSpeech.setAudioAttributes(speechAudioAttributes());
+            textToSpeech.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                @Override
+                public void onStart(String utteranceId) {
+                }
+
+                @Override
+                public void onDone(String utteranceId) {
+                    handler.post(RunService.this::abandonSpeechAudioFocus);
+                }
+
+                @Override
+                @SuppressWarnings("deprecation")
+                public void onError(String utteranceId) {
+                    handler.post(RunService.this::abandonSpeechAudioFocus);
+                }
+            });
+        });
+    }
+
+    private boolean requestSpeechAudioFocus() {
+        if (audioManager == null) {
+            return true;
+        }
+        abandonSpeechAudioFocus();
+        speechFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                .setAudioAttributes(speechAudioAttributes())
+                .setOnAudioFocusChangeListener(audioFocusListener, handler)
+                .build();
+        return audioManager.requestAudioFocus(speechFocusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+    }
+
+    private void abandonSpeechAudioFocus() {
+        if (audioManager != null && speechFocusRequest != null) {
+            audioManager.abandonAudioFocusRequest(speechFocusRequest);
+        }
+        speechFocusRequest = null;
+    }
+
+    private void stopSpeedSpeech() {
+        if (textToSpeech != null) {
+            textToSpeech.stop();
+        }
+        abandonSpeechAudioFocus();
+    }
+
+    private void shutdownTextToSpeech() {
+        if (textToSpeech != null) {
+            textToSpeech.shutdown();
+        }
+        textToSpeech = null;
+        textToSpeechReady = false;
+        textToSpeechInitializing = false;
+    }
+
+    private AudioAttributes speechAudioAttributes() {
+        return new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build();
+    }
+
     private void acquireWakeLock() {
         if (wakeLock != null && wakeLock.isHeld()) {
             return;
@@ -727,6 +959,19 @@ public final class RunService extends Service {
         return Math.max(30L * 60L * 1000L, plannedRemaining + 60L * 60L * 1000L);
     }
 
+    private boolean hasSpeedCuePhases() {
+        for (RunPhase phase : phases) {
+            if (phase.speedCues) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean currentPhaseUsesSpeedCues() {
+        return phaseIndex >= 0 && phaseIndex < phases.size() && phases.get(phaseIndex).speedCues;
+    }
+
     private double totalDistanceMeters() {
         double total = 0d;
         for (double meters : phaseMeters) {
@@ -735,11 +980,66 @@ public final class RunService extends Service {
         return total;
     }
 
+    private String formatCurrentSpeedForDisplay() {
+        if (!hasFreshSpeedEstimate()) {
+            return "Speed --";
+        }
+        return "Speed " + formatSpeed(currentSpeedMetersPerSecond);
+    }
+
+    private String speedSpeechText() {
+        if (!hasFreshSpeedEstimate()) {
+            return "Current speed is not available yet.";
+        }
+        if (currentSpeedMetersPerSecond < MIN_DISPLAY_SPEED_METERS_PER_SECOND) {
+            return "Current speed is near zero.";
+        }
+        return String.format(
+                Locale.US,
+                "Current speed %.1f kilometers per hour. Pace %s per kilometer.",
+                currentSpeedMetersPerSecond * 3.6d,
+                formatPaceForSpeech(currentSpeedMetersPerSecond));
+    }
+
+    private boolean hasFreshSpeedEstimate() {
+        return Double.isFinite(currentSpeedMetersPerSecond)
+                && lastSpeedUpdateElapsedMillis > 0L
+                && SystemClock.elapsedRealtime() - lastSpeedUpdateElapsedMillis <= SPEED_STALE_MS;
+    }
+
     static String formatDistance(double meters) {
         if (meters >= 1000d) {
             return String.format(Locale.US, "%.2f km", meters / 1000d);
         }
         return String.format(Locale.US, "%.0f m", meters);
+    }
+
+    static String formatSpeed(double metersPerSecond) {
+        if (!Double.isFinite(metersPerSecond)) {
+            return "--";
+        }
+        if (metersPerSecond < MIN_DISPLAY_SPEED_METERS_PER_SECOND) {
+            return "0.0 km/h";
+        }
+        return String.format(Locale.US, "%.1f km/h (%s/km)", metersPerSecond * 3.6d, formatPace(metersPerSecond));
+    }
+
+    private static String formatPace(double metersPerSecond) {
+        if (!Double.isFinite(metersPerSecond) || metersPerSecond < MIN_DISPLAY_SPEED_METERS_PER_SECOND) {
+            return "--";
+        }
+        long secondsPerKm = Math.round(1000d / metersPerSecond);
+        return String.format(Locale.US, "%d:%02d", secondsPerKm / 60L, secondsPerKm % 60L);
+    }
+
+    private static String formatPaceForSpeech(double metersPerSecond) {
+        long secondsPerKm = Math.max(1L, Math.round(1000d / metersPerSecond));
+        long minutes = secondsPerKm / 60L;
+        long seconds = secondsPerKm % 60L;
+        if (seconds == 0L) {
+            return minutes + " minutes";
+        }
+        return minutes + " minutes " + seconds + " seconds";
     }
 
     static boolean isProbablyRunning(Context context) {

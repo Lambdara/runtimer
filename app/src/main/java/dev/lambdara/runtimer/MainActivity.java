@@ -30,6 +30,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -191,9 +192,10 @@ public final class MainActivity extends Activity {
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
         header.addView(headerCell("", 56));
-        header.addView(headerCell("Min", 62));
-        header.addView(headerCell("Sec", 62));
-        header.addView(headerCell("Label", 0));
+        header.addView(headerCell("Min", 56));
+        header.addView(headerCell("Sec", 56));
+        header.addView(headerCell("Cue", 64));
+        header.addView(headerCell("", 0));
         header.addView(headerCell("", 48));
         root.addView(header);
 
@@ -323,7 +325,12 @@ public final class MainActivity extends Activity {
             return "Alert waiting\n" + phaseTitle + " finished\nDistance: " + RunService.formatDistance(distance);
         }
         long remaining = Math.max(0L, active.optLong("phaseEndsElapsedMillis") - SystemClock.elapsedRealtime());
-        return "Running\n" + phaseTitle + "\nRemaining: " + RunPhase.formatClock(remaining) + "\nDistance: " + RunService.formatDistance(distance);
+        double speed = active.optDouble("currentSpeedMetersPerSecond", Double.NaN);
+        return "Running\n"
+                + phaseTitle
+                + "\nRemaining: " + RunPhase.formatClock(remaining)
+                + "\nSpeed: " + RunService.formatSpeed(speed)
+                + "\nDistance: " + RunService.formatDistance(distance);
     }
 
     private void addPhaseRow(PhaseDraft draft) {
@@ -364,6 +371,10 @@ public final class MainActivity extends Activity {
             row.minutesInput.setEnabled(editable);
             row.secondsInput.setEnabled(editable);
             row.labelInput.setEnabled(editable);
+            if (!content) {
+                row.speedCueInput.setChecked(false);
+            }
+            row.speedCueInput.setEnabled(editable && content);
             row.deleteButton.setEnabled(editable && !trailingEmpty);
             row.deleteButton.setVisibility(trailingEmpty ? View.INVISIBLE : View.VISIBLE);
             row.dragHandle.setEnabled(editable && content && movableRowCount() > 1);
@@ -401,7 +412,7 @@ public final class MainActivity extends Activity {
             if (label.isEmpty()) {
                 label = "phase " + (phases.size() + 1);
             }
-            phases.add(new RunPhase(totalSeconds * 1000L, label));
+            phases.add(new RunPhase(totalSeconds * 1000L, label, row.speedCueInput.isChecked()));
             visibleRow++;
         }
         if (phases.isEmpty()) {
@@ -785,8 +796,8 @@ public final class MainActivity extends Activity {
     private LinearLayout.LayoutParams rowLayoutParams() {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(52));
-        params.setMargins(0, 0, 0, dp(8));
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.setMargins(0, 0, 0, dp(12));
         return params;
     }
 
@@ -830,12 +841,19 @@ public final class MainActivity extends Activity {
         final EditText minutesInput;
         final EditText secondsInput;
         final EditText labelInput;
+        final CheckBox speedCueInput;
         final Button deleteButton;
 
         PhaseRow(PhaseDraft draft) {
             view = new LinearLayout(MainActivity.this);
-            view.setOrientation(LinearLayout.HORIZONTAL);
-            view.setGravity(Gravity.CENTER_VERTICAL);
+            view.setOrientation(LinearLayout.VERTICAL);
+
+            LinearLayout topLine = new LinearLayout(MainActivity.this);
+            topLine.setOrientation(LinearLayout.HORIZONTAL);
+            topLine.setGravity(Gravity.CENTER_VERTICAL);
+            view.addView(topLine, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(52)));
 
             dragHandle = new TextView(MainActivity.this);
             dragHandle.setText("Drag");
@@ -844,28 +862,40 @@ public final class MainActivity extends Activity {
             dragHandle.setTypeface(Typeface.DEFAULT_BOLD);
             dragHandle.setBackground(cardBackground(Color.WHITE));
             dragHandle.setOnTouchListener((dragView, event) -> handleDragTouch(this, event));
-            view.addView(dragHandle, rowCellParams(56));
+            topLine.addView(dragHandle, rowCellParams(56));
 
             minutesInput = rowInput(draft.minutes == 0 ? "" : String.valueOf(draft.minutes),
                     InputType.TYPE_CLASS_NUMBER,
                     3);
-            view.addView(minutesInput, rowCellParams(62));
+            minutesInput.setHint("Min");
+            topLine.addView(minutesInput, rowCellParams(56));
 
             secondsInput = rowInput(draft.seconds == 0 ? "" : String.valueOf(draft.seconds),
                     InputType.TYPE_CLASS_NUMBER,
                     2);
-            view.addView(secondsInput, rowCellParams(62));
+            secondsInput.setHint("Sec");
+            topLine.addView(secondsInput, rowCellParams(56));
 
-            labelInput = rowInput(draft.label,
-                    InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES,
-                    32);
-            view.addView(labelInput, rowCellParams(0));
+            speedCueInput = new CheckBox(MainActivity.this);
+            speedCueInput.setGravity(Gravity.CENTER);
+            speedCueInput.setChecked(draft.speedCues);
+            topLine.addView(speedCueInput, rowCellParams(64));
 
             deleteButton = new Button(MainActivity.this);
             deleteButton.setText("X");
             deleteButton.setAllCaps(false);
             deleteButton.setOnClickListener(button -> deletePhaseRow(this));
-            view.addView(deleteButton, rowCellParams(48));
+            topLine.addView(deleteButton, rowCellParams(48));
+
+            labelInput = rowInput(draft.label,
+                    InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES,
+                    32);
+            labelInput.setHint("Label");
+            LinearLayout.LayoutParams labelParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(48));
+            labelParams.setMargins(dp(3), dp(8), dp(3), 0);
+            view.addView(labelInput, labelParams);
 
             TextWatcher watcher = new TextWatcher() {
                 @Override
@@ -895,11 +925,17 @@ public final class MainActivity extends Activity {
         final int minutes;
         final int seconds;
         final String label;
+        final boolean speedCues;
 
         PhaseDraft(int minutes, int seconds, String label) {
+            this(minutes, seconds, label, false);
+        }
+
+        PhaseDraft(int minutes, int seconds, String label, boolean speedCues) {
             this.minutes = minutes;
             this.seconds = seconds;
             this.label = label;
+            this.speedCues = speedCues;
         }
     }
 }

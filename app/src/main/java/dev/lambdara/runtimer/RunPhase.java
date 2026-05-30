@@ -19,10 +19,16 @@ final class RunPhase {
 
     final long durationMillis;
     final String label;
+    final boolean speedCues;
 
     RunPhase(long durationMillis, String label) {
+        this(durationMillis, label, false);
+    }
+
+    RunPhase(long durationMillis, String label, boolean speedCues) {
         this.durationMillis = durationMillis;
         this.label = label == null ? "" : label.trim();
+        this.speedCues = speedCues;
     }
 
     String title() {
@@ -36,11 +42,15 @@ final class RunPhase {
         JSONObject json = new JSONObject();
         json.put("durationMillis", durationMillis);
         json.put("label", label);
+        json.put("speedCues", speedCues);
         return json;
     }
 
     static RunPhase fromJson(JSONObject json) {
-        return new RunPhase(json.optLong("durationMillis"), json.optString("label"));
+        return new RunPhase(
+                json.optLong("durationMillis"),
+                json.optString("label"),
+                json.optBoolean("speedCues", false));
     }
 
     static String toJsonString(List<RunPhase> phases) throws JSONException {
