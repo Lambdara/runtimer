@@ -58,8 +58,9 @@ public final class RunService extends Service {
     private static final int NOTIFICATION_ID = 41;
     private static final long LOCATION_INTERVAL_MS = 1000L;
     private static final float LOCATION_MIN_METERS = 0f;
-    private static final float MAX_GOOD_ACCURACY_METERS = 65f;
-    private static final double MAX_REASONABLE_SPEED_METERS_PER_SECOND = 14.0;
+    private static final float MAX_GOOD_ACCURACY_METERS = DistanceAccumulator.DEFAULT_MAX_ACCURACY_METERS;
+    private static final double MAX_REASONABLE_SPEED_METERS_PER_SECOND =
+            DistanceAccumulator.DEFAULT_MAX_SPEED_METERS_PER_SECOND;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final DistanceAccumulator distanceAccumulator = new DistanceAccumulator(
@@ -300,6 +301,7 @@ public final class RunService extends Service {
             log.put("endedAt", endedAt);
             log.put("title", new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(new Date(runStartedWallMillis)));
             log.put("scheduleText", scheduleText);
+            log.put("distanceAlgorithmVersion", DistanceAccumulator.ALGORITHM_VERSION);
             log.put("aborted", aborted);
             log.put("abortedPhaseIndex", aborted ? phaseIndex : -1);
             log.put("abortedWhileAwaitingDismiss", aborted && state == STATE_AWAITING_DISMISS);
@@ -380,7 +382,11 @@ public final class RunService extends Service {
                 location.getAccuracy());
         phaseMeters[phaseIndex] += distanceResult.addedMeters;
         if (distanceResult.recorded) {
-            appendRoutePoint(location, locationTime, !distanceResult.connectsFromPrevious);
+            appendRoutePoint(
+                    distanceResult.latitude,
+                    distanceResult.longitude,
+                    locationTime,
+                    !distanceResult.connectsFromPrevious);
         }
         long now = SystemClock.elapsedRealtime();
         if (now - lastStatusWriteElapsedMillis >= 3000L) {
@@ -388,11 +394,11 @@ public final class RunService extends Service {
         }
     }
 
-    private void appendRoutePoint(Location location, long locationTime, boolean breakBefore) {
+    private void appendRoutePoint(double latitude, double longitude, long locationTime, boolean breakBefore) {
         try {
             JSONObject point = new JSONObject();
-            point.put("lat", location.getLatitude());
-            point.put("lon", location.getLongitude());
+            point.put("lat", latitude);
+            point.put("lon", longitude);
             point.put("time", locationTime);
             point.put("phase", phaseIndex);
             point.put("breakBefore", breakBefore);

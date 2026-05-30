@@ -6,6 +6,8 @@ public final class DistanceAccumulatorSelfTest {
         ignoresInaccurateLocationsWithoutMovingAnchorPoint();
         rejectsImplausibleSpeedButKeepsNextAnchorPoint();
         resetStartsANewPhaseWithoutCarryOverDistance();
+        suppressesStationaryJitter();
+        keepsNoisyRunningDistanceReasonable();
         System.out.println("Distance simulation checks passed.");
     }
 
@@ -63,6 +65,53 @@ public final class DistanceAccumulatorSelfTest {
         assertRecorded(firstPointOfNextPhase, false, "first point after reset");
     }
 
+    private static void suppressesStationaryJitter() {
+        DistanceAccumulator accumulator = new DistanceAccumulator(65f, 14d);
+        double total = 0d;
+        double baseLatitude = 52.000000;
+        double baseLongitude = 5.000000;
+
+        for (int i = 0; i <= 180; i++) {
+            double northMeters = ((i % 6) - 2.5d) * 1.1d;
+            double eastMeters = ((i % 5) - 2d) * 1.2d;
+            DistanceAccumulator.AddResult result = accumulator.add(
+                    latitudeAt(baseLatitude, northMeters),
+                    longitudeAt(baseLatitude, baseLongitude, eastMeters),
+                    i * 1000L,
+                    true,
+                    8f);
+            total += result.addedMeters;
+        }
+
+        if (total > 20d) {
+            throw new AssertionError("stationary jitter should not accumulate meaningful distance, got " + total);
+        }
+    }
+
+    private static void keepsNoisyRunningDistanceReasonable() {
+        DistanceAccumulator accumulator = new DistanceAccumulator(65f, 14d);
+        double total = 0d;
+        double baseLatitude = 52.000000;
+        double baseLongitude = 5.000000;
+
+        for (int i = 0; i <= 120; i++) {
+            double trueNorthMeters = i * 3d;
+            double noisyNorthMeters = trueNorthMeters + Math.sin(i * 0.7d) * 2.2d;
+            double noisyEastMeters = (i % 2 == 0 ? 1d : -1d) * 3.5d;
+            DistanceAccumulator.AddResult result = accumulator.add(
+                    latitudeAt(baseLatitude, noisyNorthMeters),
+                    longitudeAt(baseLatitude, baseLongitude, noisyEastMeters),
+                    i * 1000L,
+                    true,
+                    8f);
+            total += result.addedMeters;
+        }
+
+        if (total < 320d || total > 410d) {
+            throw new AssertionError("noisy 360m run should stay close to real distance, got " + total);
+        }
+    }
+
     private static void assertClose(double expected, double actual, double tolerance, String label) {
         if (Math.abs(expected - actual) > tolerance) {
             throw new AssertionError(label + ": expected " + expected + " +/- " + tolerance + ", got " + actual);
@@ -76,5 +125,14 @@ public final class DistanceAccumulatorSelfTest {
         if (result.connectsFromPrevious != connectsFromPrevious) {
             throw new AssertionError(label + ": expected connectsFromPrevious=" + connectsFromPrevious);
         }
+    }
+
+    private static double latitudeAt(double baseLatitude, double northMeters) {
+        return baseLatitude + Math.toDegrees(northMeters / 6371008.8d);
+    }
+
+    private static double longitudeAt(double baseLatitude, double baseLongitude, double eastMeters) {
+        double metersPerRadian = 6371008.8d * Math.cos(Math.toRadians(baseLatitude));
+        return baseLongitude + Math.toDegrees(eastMeters / metersPerRadian);
     }
 }
